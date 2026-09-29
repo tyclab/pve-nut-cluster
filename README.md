@@ -77,7 +77,9 @@ Every node needs its BIOS set to power on after AC loss. Every node that tier 1 
 its MAC in the server's `WOL_TARGETS`.
 
 **Passwords must not contain `#`.** upsmon sends `PASSWORD` unquoted, and upsd's parser ends the word at an unescaped
-`#`, so that login fails. The config-file side of this is NUT issue #3711.
+`#`, so that login fails
+([networkupstools/nut#3721](https://github.com/networkupstools/nut/issues/3721); the config-file side is
+[#3711](https://github.com/networkupstools/nut/issues/3711)).
 
 ## Check it
 
