@@ -1,0 +1,10 @@
+[Unit]
+Description=UPS tier action requested by upssched (shed or restore)
+Documentation=https://github.com/tyclab/pve-nut-cluster
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/pve-nut-tier.sh consume
+# Wake rounds take up to 10 min; a tier-1 halt node runs the whole final wave here.
+TimeoutStartSec=30min

@@ -1,0 +1,13 @@
+# /etc/nut/upsd.users on the server: one login per consumer.
+#
+# No `#` in a password upsmon uses. upsmon sends PASSWORD unquoted and upsd tokenizes the line
+# with parseconf, which ends a word at an unescaped `#`: such a login never succeeds from upsmon.
+# In this file parseconf treats `#` as a comment even inside quotes; escape it as `\#`.
+
+[pveprimary]
+password = "change-me-primary"
+upsmon primary
+
+[pvesecondary]
+password = "change-me-secondary"
+upsmon secondary

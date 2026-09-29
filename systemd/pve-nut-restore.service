@@ -1,0 +1,19 @@
+[Unit]
+Description=Re-adopt the HA rows and restart the guests the UPS sequence parked or shed
+Documentation=https://github.com/tyclab/pve-nut-cluster
+# Any file triggers (|): parked by the final wave, shed by tier 1, tier1 = a peer to wake.
+ConditionPathExists=|/var/lib/pve-nut-shutdown/parked
+ConditionPathExists=|/var/lib/pve-nut-shutdown/shed
+ConditionPathExists=|/var/lib/pve-nut-shutdown/tier1
+After=pve-cluster.service pve-ha-crm.service pve-ha-lrm.service pve-guests.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/pve-nut-tier.sh boot
+# The HA gate polls up to 15 min (every node cold-boots after a power return), the wake up to 10 min.
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target

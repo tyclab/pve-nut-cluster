@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch for a UPS tier request from upssched
+Documentation=https://github.com/tyclab/pve-nut-cluster
+# /run/nut/tier comes from /etc/tmpfiles.d/pve-nut.conf; a path unit on a missing directory fails.
+After=systemd-tmpfiles-setup.service
+
+[Path]
+PathExistsGlob=/run/nut/tier/*.request
+
+[Install]
+WantedBy=multi-user.target
