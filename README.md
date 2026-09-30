@@ -54,7 +54,7 @@ owns the guests.
 | `systemd/pve-nut-tier.{path,service}` | `/etc/systemd/system/`    | runs `pve-nut-tier.sh consume` on a request file      |
 | `systemd/pve-nut-restore.service` | `/etc/systemd/system/`        | runs `pve-nut-tier.sh boot` when state is pending     |
 | `tmpfiles.d/pve-nut.conf`        | `/etc/tmpfiles.d/`             | `/run/nut/tier`, owned by `nut`                       |
-| `examples/*`                     | `/etc/nut/`                    | `pve-nut.conf`, `ups.conf`, `upsd.users`, `upsmon.conf`, `upssched.conf` |
+| `examples/*`                     | copy by hand to `/etc/nut/`    | `pve-nut.conf`, `ups.conf`, `upsd.users`, `upsmon.conf`, `upssched.conf` |
 
 ## Install
 
