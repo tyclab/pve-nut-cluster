@@ -3,8 +3,8 @@
 DESTDIR ?=
 
 BIN  := bin/pve-nut-shutdown.sh bin/pve-nut-upssched-cmd.sh
-SBIN := sbin/pve-nut-tier.sh sbin/pve-nut-restore.sh sbin/pve-ha-node-online.py
-UNITS := systemd/pve-nut-restore.service systemd/pve-nut-tier.path systemd/pve-nut-tier.service
+SBIN := sbin/pve-nut-tier.sh sbin/pve-nut-restore.sh sbin/pve-ha-node-online.py sbin/pve-nut-guest-ready.py sbin/pve-nut-state.py
+UNITS := systemd/pve-nut-restore.service systemd/pve-nut-restore.timer systemd/pve-nut-tier.path systemd/pve-nut-tier.service
 
 .PHONY: install lint test
 
@@ -17,7 +17,7 @@ install:
 
 lint:
 	shellcheck $(BIN) sbin/*.sh
-	python3 -m py_compile sbin/pve-ha-node-online.py tests/test_pve_nut_scripts.py
+	python3 -m py_compile sbin/pve-ha-node-online.py sbin/pve-nut-guest-ready.py sbin/pve-nut-state.py tests/test_pve_nut_scripts.py
 
 test:
 	python3 -m unittest discover -s tests -v

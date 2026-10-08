@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry incomplete UPS restoration with persisted attempt limits
+Documentation=https://github.com/tyclab/pve-nut-cluster
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=60s
+Unit=pve-nut-restore.service
+
+[Install]
+WantedBy=timers.target

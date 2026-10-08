@@ -11,8 +11,8 @@
 #     2. stop every other guest at once, 3. force what is left, 4. stop the EDGE_VMIDS last (a
 #        router VM routes for everything else), 4b. primary only: wait for the NAS (Synology DSM
 #        enters Standby at FSD) to close NAS_PORTS and for PEER_HOSTS to stop answering ping, since
-#        this node's halt runs upsdrvctl shutdown and cuts UPS output ups.delay.shutdown (20 s)
-#        later. upsmon's own HOSTSYNC does not cover them: a secondary upsmon logs off the moment it
+#        this node's halt runs upsdrvctl shutdown and cuts UPS output at the driver/firmware delay.
+#         upsmon's own HOSTSYNC does not cover them: a secondary upsmon logs off the moment it
 #        starts its shutdown command (SHUTDOWNEXIT), long before its guests are down. 5. halt.
 #     1b. between park and stop: pve-ha-lrm and pve-ha-crm are stopped, which closes the HA watchdog
 #        cleanly. A node that loses quorum mid-wave with an active LRM is fenced 60 s later; a drill
@@ -29,23 +29,17 @@
 #            node hosts, recorded as `<sid> ha|plain` for the restore; SHED_HALT_NODE=1 then runs
 #            the final wave. An enumeration failure sheds nothing (exit 1).
 #
-# Budget. The bounds below assume the driver asserts LB at battery.runtime.low = 600 s
-# (examples/ups.conf, ignorelb); size that override to your load. FINALDELAY 5 s and, on the
-# primary, HOSTSYNC 15 s are spent before this starts.
-#
-#   step                          bound   how
-#   1  park HA rows                30 s   ha-manager set, 5 s timeout each
-#   1b stop pve-ha-lrm/crm         30 s   releases the HA watchdog (see above)
-#   2  graceful stop, parallel     90 s   qm shutdown --timeout 90 / pct shutdown --timeout 60
-#   3  force sweep, parallel       20 s   qm stop / pct stop --overrule-shutdown on what step 2 left
-#   4  edge VMs                    45 s   qm shutdown --forceStop 1 --timeout 45, then qm stop
-#   4b NAS closed, peers down     180 s   primary only, TCP probe of NAS_PORTS + ping PEER_HOSTS every 5 s
-#   5  halt                         -     /sbin/shutdown -h +0
-#   total                         395 s primary / 215 s secondary, of 580 s / 595 s available
-#
-# Without step 4b, a real outage ran the primary's wave in 26 s and halted it, cutting UPS output,
-# while a secondary was 4 s into its own wave. A failed park or an overrunning stop is logged and
-# the halt proceeds. $STATE_DIR/.lock is shared with pve-nut-restore.sh (30 s, then on).
+# Budget. Explicit command limits include both serial edge VMs, discovery, lock wait,
+# polling and command kill grace. With two configured edges and KILLPOWER_WAIT=180:
+#   lock30 + park30 + HA30 + graceful/discovery102 + force/discovery32 + edge110
+#   + summary10 + kill-grace allowance20 + NAS/peer182 =552s primary (370s secondary), including6s durable ownership publication.
+# Add pre-script FINALDELAY5 + primary HOSTSYNC15, HOST_TEARDOWN_RESERVE120 (includes
+# an observed96s,90s of it an NFS unmount), UPS_OUTPUT_RESERVE120 on the primary,
+# and BUDGET_MARGIN120 =>1032s primary. The default600s runtime-low is below this plan; size it to measured reserve.
+# These host/UPS values are planning reserves, not enforced hardware bounds. An
+# ageing battery can collapse before any runtime estimate; measure them under load.
+# Blocked kernel I/O cannot be made safe by a shell timeout. Do not globally use
+# soft NFS or force-unmount active storage to make a paper budget look shorter.
 #
 # --dry-run prints the plan and changes nothing (combine with --shed).
 # Test seams: PVE_NUT_STATE_DIR LOG HALT_CMD CONF NAS_POLL SYSTEMCTL.
@@ -76,6 +70,8 @@ WAKE_MARK="$STATE_DIR/tier1"
 NUT_RESET_MARK="$STATE_DIR/nut-reset"
 DRILL=0
 CONF=${PVE_NUT_CONF:-/etc/nut/pve-nut.conf}
+BOOT_ID=${PVE_NUT_BOOT_ID:-$(cat /proc/sys/kernel/random/boot_id)}
+STATE_WRITE=${PVE_NUT_STATE_WRITER:-/usr/local/sbin/pve-nut-state.py}
 POLL=${PVE_NUT_NAS_POLL:-5}
 NODE=$(hostname)
 
@@ -88,6 +84,10 @@ NAS_HOST=""
 NAS_PORTS=""
 PEER_HOSTS=""
 KILLPOWER_WAIT=180
+BUDGET_LB=600
+HOST_TEARDOWN_RESERVE=120
+UPS_OUTPUT_RESERVE=120
+BUDGET_MARGIN=120
 CONF_OK=1
 if [[ -r "$CONF" ]]; then
   # shellcheck disable=SC1090
@@ -108,13 +108,22 @@ STOP_BOUND=90
 FORCE_BOUND=20
 EDGE_TIMEOUT=45
 LOCK_WAIT=30
-BUDGET_LB=600
 BUDGET_FINALDELAY=5
 BUDGET_HOSTSYNC=15
-SHED_BOUND=$((PARK_BOUND + STOP_BOUND + FORCE_BOUND))
-TOTAL_BOUND=$((SHED_BOUND + HA_STOP_BOUND + EDGE_TIMEOUT))
+QUERY_TIMEOUT=5
+FORCE_TIMEOUT=10
+# Include discovery, polling quantisation and every configured edge, even when HA
+# has temporarily placed both on this node. Host/UPS reserves are assumptions to
+# measure in an attended acceptance test; they are not firmware guarantees.
+EDGE_COUNT=0
+for _edge in $EDGE_VMIDS; do EDGE_COUNT=$((EDGE_COUNT + 1)); done
+COMMON_STOP_BOUND=$((PARK_BOUND + 4 * QUERY_TIMEOUT + STOP_BOUND + FORCE_BOUND + 4))
+# Tier selection adds one discovery pair before the common stop path; it has its
+# own lock and command/publication allowances, not the primary NAS/edge tail.
+SHED_BOUND=$((LOCK_WAIT + COMMON_STOP_BOUND + 2 * QUERY_TIMEOUT + 20 + 6))
+TOTAL_BOUND=$((LOCK_WAIT + COMMON_STOP_BOUND + HA_STOP_BOUND + EDGE_COUNT * (EDGE_TIMEOUT + FORCE_TIMEOUT) + 2 * QUERY_TIMEOUT + 20 + 6))
 WAIT_BOUND=0
-[[ "$NUT_ROLE" == server && -n "$NAS_HOST$PEER_HOSTS" ]] && WAIT_BOUND=$KILLPOWER_WAIT
+[[ "$NUT_ROLE" == server && -n "$NAS_HOST$PEER_HOSTS" ]] && WAIT_BOUND=$((KILLPOWER_WAIT + 2))
 
 log() {
   if ((DRY)); then
@@ -128,16 +137,20 @@ log() {
 # An enumeration failure must never read as "no guests left": every listing is
 # status-checked, and a broken qm/pct degrades the summary to UNKNOWN.
 ENUM_FAILED=0
-running_vms() { qm list 2>> "$LOG" | awk 'NR>1 && $(NF-3)=="running" {print $1}'; }
-running_cts() { pct list 2>> "$LOG" | awk 'NR>1 && $2=="running" {print $1}'; }
+running_vms() { timeout --kill-after=1 "$QUERY_TIMEOUT" qm list 2>> "$LOG" | awk 'NR>1 && $(NF-3)=="running" {print $1}'; }
+running_cts() { timeout --kill-after=1 "$QUERY_TIMEOUT" pct list 2>> "$LOG" | awk 'NR>1 && $2=="running" {print $1}'; }
 local_sids() {
+  local vms cts
+  vms=$(timeout --kill-after=1 "$QUERY_TIMEOUT" qm list 2>> "$LOG") || return 1
+  cts=$(timeout --kill-after=1 "$QUERY_TIMEOUT" pct list 2>> "$LOG") || return 1
   {
-    qm list 2>> "$LOG" | awk 'NR>1 {print "vm:"$1}'
-    pct list 2>> "$LOG" | awk 'NR>1 {print "ct:"$1}'
+    awk 'NR>1 {print "vm:"$1}' <<< "$vms"
+    awk 'NR>1 {print "ct:"$1}' <<< "$cts"
   } | tr '\n' ' '
 }
+
 ha_rows() { # "sid state" per row
-  pvesh get /cluster/ha/resources --output-format json 2>> "$LOG" | python3 -c '
+  timeout --kill-after=1 "$QUERY_TIMEOUT" pvesh get /cluster/ha/resources --output-format json 2>> "$LOG" | python3 -c '
 import json, sys
 for r in json.load(sys.stdin):
     print(r["sid"], r.get("state", ""))'
@@ -152,7 +165,7 @@ in_scope() { # vm|ct id
 # ─── step 1: park ────────────────────────────────────────────────────────
 park_row() {
   if ((DRY)); then echo "    ha-manager set $1 --state ignored"; return 0; fi
-  if timeout "$PARK_TIMEOUT" ha-manager set "$1" --state ignored 2>> "$LOG"; then
+  if timeout --kill-after=1 "$PARK_TIMEOUT" ha-manager set "$1" --state ignored 2>> "$LOG"; then
     log "parked $1"
     return 0
   fi
@@ -161,27 +174,42 @@ park_row() {
 }
 
 park_ha_rows() {
-  local rows local_ids sid state parked=0
+  local rows local_ids sid state parked=0 deadline=$((SECONDS + PARK_BOUND)) remaining intents=""
   if ! rows=$(ha_rows); then
-    log "ERROR: HA resources could not be read, nothing parked; every HA row needs 'ha-manager set <sid> --state started' after power return"
+    log "ERROR: HA resources could not be read, nothing parked; HA recovery requires manual review"
     return
   fi
-  local_ids=" $(local_sids)"
+  if ! local_ids=$(local_sids); then
+    ENUM_FAILED=1
+    log "ERROR: local guest enumeration failed before HA parking"
+    return
+  fi
+  local_ids=" $local_ids"
   while read -r sid state; do
     [[ -n "$sid" && "$local_ids" == *" $sid "* ]] || continue
-    case "$state" in started | error) ;; *) continue ;; esac
-    if park_row "$sid" && ((!DRY)); then
-      echo "$sid" >> "$PARKED"
-      parked=$((parked + 1))
-    fi
+    case "$state" in started | error) intents+="$sid"$'\n' ;; esac
   done <<< "$rows"
-  ((DRY)) || log "step 1 done: $parked row(s) parked in $PARKED"
+  [[ -n "$intents" ]] || return 0
+  # Journal ALL intended rows before any request, even those the park deadline
+  # later skips. qm shutdown can persist stopped for an unparked HA guest.
+  if ((!DRY)) && ! printf '%s' "$intents" | timeout --kill-after=1 5 "$STATE_WRITE" append "$PARKED"; then
+    log "ERROR: cannot persist recovery intents; HA rows left untouched, shutdown continues"
+    return
+  fi
+  while read -r sid; do
+    [[ -n "$sid" ]] || continue
+    remaining=$((deadline - SECONDS))
+    if ((!DRY && remaining <= 0)); then log "ERROR: HA park deadline reached; remaining intents retained"; break; fi
+    ((remaining < PARK_TIMEOUT && remaining > 0)) && PARK_TIMEOUT=$remaining
+    if park_row "$sid" && ((!DRY)); then parked=$((parked + 1)); fi
+  done <<< "$intents"
+  ((DRY)) || log "step 1 done: $parked row(s) parked; all recovery intents retained in $PARKED"
 }
 
 # ─── step 1b: release the HA watchdog ────────────────────────────────────
 ha_release() {
   if ((DRY)); then echo "    $SYSTEMCTL stop pve-ha-lrm pve-ha-crm"; return 0; fi
-  if timeout "$HA_STOP_BOUND" "$SYSTEMCTL" stop pve-ha-lrm pve-ha-crm 2>> "$LOG"; then
+  if timeout --kill-after=1 "$HA_STOP_BOUND" "$SYSTEMCTL" stop pve-ha-lrm pve-ha-crm 2>> "$LOG"; then
     log "step 1b done: pve-ha-lrm and pve-ha-crm stopped, HA watchdog released"
   else
     log "WARN: stopping pve-ha-lrm/pve-ha-crm failed or exceeded ${HA_STOP_BOUND} s; a quorum loss now fences this node"
@@ -237,7 +265,7 @@ shed_select() {
 # `ha` rows were parked and come back with --state started; `plain` ones with qm/pct start
 # (which forwards to HA itself when a row exists).
 shed_record() {
-  local rows sid state kind
+  local rows sid state kind intents="" deadline=$((SECONDS + PARK_BOUND)) remaining
   if ! rows=$(ha_rows); then
     rows=""
     log "ERROR: HA resources could not be read; shed HA rows stop through crm-command and are recorded plain"
@@ -245,9 +273,22 @@ shed_record() {
   for sid in $SHED_IDS; do
     kind=plain
     state=$(awk -v s="$sid" '$1==s {print $2}' <<< "$rows")
-    case "$state" in started | error) park_row "$sid" && kind=ha ;; esac
-    if ((DRY)); then echo "    record $sid $kind"; else echo "$sid $kind" >> "$SHED_FILE"; fi
+    case "$state" in started | error) kind=ha ;; esac
+    intents+="$sid $kind"$'\n'
+    ((DRY)) && echo "    record $sid $kind"
   done
+  [[ -n "$intents" ]] || return 0
+  if ((!DRY)) && ! printf '%s' "$intents" | timeout --kill-after=1 5 "$STATE_WRITE" append "$SHED_FILE"; then
+    log "ERROR: cannot persist recovery intents; aborting tier shed"
+    exit 1
+  fi
+  while read -r sid kind; do
+    [[ "$kind" == ha ]] || continue
+    remaining=$((deadline - SECONDS))
+    if ((!DRY && remaining <= 0)); then log "ERROR: tier park deadline reached; remaining intents retained"; break; fi
+    ((remaining < PARK_TIMEOUT && remaining > 0)) && PARK_TIMEOUT=$remaining
+    park_row "$sid" || true
+  done <<< "$intents"
   ((DRY)) || log "shed: $(count_words "$SHED_IDS") guest(s) recorded in $SHED_FILE"
 }
 
@@ -260,9 +301,9 @@ JOBS=()
 stop_vm() {
   if ((DRY)); then echo "    qm shutdown $1 --forceStop 1 --timeout $2"; return 0; fi
   log "stopping VM $1 (timeout $2 s)"
-  if qm shutdown "$1" --forceStop 1 --timeout "$2" 2>> "$LOG"; then log "VM $1 stopped"; return 0; fi
+  if timeout --kill-after=1 "$2" qm shutdown "$1" --forceStop 1 --timeout "$2" 2>> "$LOG"; then log "VM $1 stopped"; return 0; fi
   log "WARN: qm shutdown $1 failed, force-stopping"
-  if qm stop "$1" --overrule-shutdown 1 2>> "$LOG"; then log "VM $1 force-stopped"; return 0; fi
+  if timeout --kill-after=1 "$FORCE_TIMEOUT" qm stop "$1" --overrule-shutdown 1 2>> "$LOG"; then log "VM $1 force-stopped"; return 0; fi
   log "ERROR: qm stop $1 failed"
   return 1
 }
@@ -270,9 +311,9 @@ stop_vm() {
 stop_ct() {
   if ((DRY)); then echo "    pct shutdown $1 --forceStop 1 --timeout $2"; return 0; fi
   log "stopping CT $1 (timeout $2 s)"
-  if pct shutdown "$1" --forceStop 1 --timeout "$2" 2>> "$LOG"; then log "CT $1 stopped"; return 0; fi
+  if timeout --kill-after=1 "$2" pct shutdown "$1" --forceStop 1 --timeout "$2" 2>> "$LOG"; then log "CT $1 stopped"; return 0; fi
   log "WARN: pct shutdown $1 failed, force-stopping"
-  if pct stop "$1" --overrule-shutdown 1 2>> "$LOG"; then log "CT $1 force-stopped"; return 0; fi
+  if timeout --kill-after=1 "$FORCE_TIMEOUT" pct stop "$1" --overrule-shutdown 1 2>> "$LOG"; then log "CT $1 force-stopped"; return 0; fi
   log "ERROR: pct stop $1 failed"
   return 1
 }
@@ -280,13 +321,13 @@ stop_ct() {
 force_vm() {
   if ((DRY)); then echo "    qm stop $1 --overrule-shutdown 1"; return 0; fi
   log "force-stopping VM $1"
-  qm stop "$1" --overrule-shutdown 1 2>> "$LOG" || log "ERROR: qm stop $1 failed"
+  timeout --kill-after=1 "$FORCE_TIMEOUT" qm stop "$1" --overrule-shutdown 1 2>> "$LOG" || log "ERROR: qm stop $1 failed"
 }
 
 force_ct() {
   if ((DRY)); then echo "    pct stop $1 --overrule-shutdown 1"; return 0; fi
   log "force-stopping CT $1"
-  pct stop "$1" --overrule-shutdown 1 2>> "$LOG" || log "ERROR: pct stop $1 failed"
+  timeout --kill-after=1 "$FORCE_TIMEOUT" pct stop "$1" --overrule-shutdown 1 2>> "$LOG" || log "ERROR: pct stop $1 failed"
 }
 
 wait_jobs() { # bound-seconds label
@@ -370,24 +411,31 @@ edge_round() {
 }
 
 # ─── step 4b: NAS and peers ──────────────────────────────────────────────
-port_open() { timeout 2 bash -c "exec 3<>/dev/tcp/$1/$2" 2> /dev/null; }
+port_open() { timeout --kill-after=1 2 bash -c "exec 3<>/dev/tcp/$1/$2" 2> /dev/null; }
 peer_up() { ping -c 1 -W 2 "$1" > /dev/null 2>&1; }
 
 killpower_wait() {
-  local deadline port host open
+  local deadline port host open remaining
   ((WAIT_BOUND > 0)) || return 0
   if ((DRY)); then echo "    probe $NAS_HOST ports $NAS_PORTS and ping ${PEER_HOSTS:-<no peers>} every $POLL s until closed and down"; return 0; fi
   deadline=$((SECONDS + KILLPOWER_WAIT))
   while :; do
     open=""
-    for port in $NAS_PORTS; do port_open "$NAS_HOST" "$port" && open+="$NAS_HOST:$port "; done
-    for host in $PEER_HOSTS; do peer_up "$host" && open+="$host "; done
-    if [[ -z "$open" ]]; then log "step 4b done: NAS $NAS_HOST closed ${NAS_PORTS// /,}, peers down: ${PEER_HOSTS:-none}"; return 0; fi
+    for port in $NAS_PORTS; do
+      ((SECONDS >= deadline)) && break
+      port_open "$NAS_HOST" "$port" && open+="$NAS_HOST:$port "
+    done
+    for host in $PEER_HOSTS; do
+      ((SECONDS >= deadline)) && break
+      peer_up "$host" && open+="$host "
+    done
     if ((SECONDS >= deadline)); then
-      log "WARN: still answering after $KILLPOWER_WAIT s: ${open% }; halting anyway"
+      log "WARN: NAS/peer readiness not confirmed within $KILLPOWER_WAIT s: ${open% }; halting anyway"
       return 1
     fi
-    sleep "$POLL"
+    if [[ -z "$open" ]]; then log "step 4b done: NAS $NAS_HOST closed ${NAS_PORTS// /,}, peers down: ${PEER_HOSTS:-none}"; return 0; fi
+    remaining=$((deadline - SECONDS))
+    if ((remaining < POLL)); then sleep "$remaining"; else sleep "$POLL"; fi
   done
 }
 
@@ -407,6 +455,14 @@ summary_and_halt() {
     log "all guests stopped, halting"
   fi
   $HALT_CMD
+}
+
+budget_report() {
+  local before=$BUDGET_FINALDELAY output=0 required script=$((TOTAL_BOUND + WAIT_BOUND))
+  if [[ "$NUT_ROLE" == server ]]; then before=$((before + BUDGET_HOSTSYNC)); output=$UPS_OUTPUT_RESERVE; fi
+  required=$((before + script + HOST_TEARDOWN_RESERVE + output + BUDGET_MARGIN))
+  log "planned reserve: pre-script ${before}s + script ${script}s + host teardown ${HOST_TEARDOWN_RESERVE}s + UPS output ${output}s + margin ${BUDGET_MARGIN}s = ${required}s; runtime-low ${BUDGET_LB}s"
+  if ((required > BUDGET_LB)); then log "WARN: runtime-low is below planned reserve by $((required - BUDGET_LB))s"; fi
 }
 
 # ─── dry run ─────────────────────────────────────────────────────────────
@@ -443,10 +499,10 @@ dry_run() {
   echo "step 3  force sweep, all at once (bound ${FORCE_BOUND} s)"
   force_sweep
   if ((DRILL)); then echo "step 4  edge VM: kept running (drill)"; else echo "step 4  edge VM last (bound ${EDGE_TIMEOUT} s)"; edge_round; fi
-  echo "step 4b NAS shares closed and peers down (primary only, bound ${WAIT_BOUND} s)"
+  echo "step 4b NAS shares closed and peers down (primary only, bound ${KILLPOWER_WAIT} s)"
   killpower_wait
   if ((DRILL)); then echo "step 5  drill: no halt, no killpower; HA restarted, pve-nut-restore.service wakes the peers"; else echo "step 5  halt: $HALT_CMD"; fi
-  echo "script bound $((TOTAL_BOUND + WAIT_BOUND)) s; headroom for the halt $((available_primary - TOTAL_BOUND - WAIT_BOUND)) s (primary) / $((available_secondary - TOTAL_BOUND)) s (secondary)"
+  budget_report
   ((ENUM_FAILED)) && { echo "ERROR: guest enumeration failed, the plan above is incomplete"; exit 1; }
   exit 0
 }
@@ -455,8 +511,13 @@ dry_run() {
 
 # ─── live ────────────────────────────────────────────────────────────────
 mkdir -p "$STATE_DIR"
+# Publish final-wave ownership before waiting for the restore lock. This boot may never restore
+# just because mains returns after FSD. A later boot has a different kernel boot id.
+if ((!SHED)); then printf '%s\n' "$BOOT_ID" | timeout --kill-after=1 5 "$STATE_WRITE" write "$STATE_DIR/final-wave" || log "ERROR: cannot persist final-wave ownership; critical shutdown continues under FSD guard"; fi
 exec 9> "$STATE_DIR/.lock"
 flock -w "$LOCK_WAIT" 9 || log "WARN: $STATE_DIR/.lock busy for $LOCK_WAIT s (a restore running?), proceeding"
+# A new recorded wave owns a fresh bounded recovery attempt set.
+rm -f "$STATE_DIR/restore-attempts" "$STATE_DIR"/error-reset-*
 ((CONF_OK)) || log "ERROR: $CONF unreadable; defaults: role client, no shed list, no step 4b"
 if ((SHED)); then
   log "tier 1 on $NODE: shed ${SHED_VMIDS:-<none>} (bound ${SHED_BOUND} s), halt node: $SHED_HALT_NODE"
@@ -471,6 +532,7 @@ if ((SHED)); then
   fi
   log "tier 1 done, SHED_HALT_NODE=1: final wave follows"
   SHED=0
+  printf '%s\n' "$BOOT_ID" | timeout --kill-after=1 5 "$STATE_WRITE" write "$STATE_DIR/final-wave" || log "ERROR: cannot persist final-wave ownership; critical shutdown continues under FSD guard"
 fi
 if [[ "$NUT_ROLE" == server && -e "$DRILL_MARK" ]]; then
   DRILL=1
@@ -478,6 +540,7 @@ if [[ "$NUT_ROLE" == server && -e "$DRILL_MARK" ]]; then
   log "DRILL on $NODE: final wave without halt and killpower; the edge stays up"
 fi
 log "NUT shutdown initiated on $NODE; script bound $((TOTAL_BOUND + WAIT_BOUND)) s"
+budget_report
 park_ha_rows
 ha_release
 ((DRILL)) && drill_record_plain
