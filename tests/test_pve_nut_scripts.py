@@ -47,7 +47,8 @@ echo "ha-manager $*" >> "$FAKE/calls"
 case "$1" in
   status) if [ -e "$FAKE/no-quorum" ]; then echo "quorum No quorum"; else echo "quorum OK"; echo "master pve1 (active, Sat Sep 27 12:00:00 2026)"; fi ;;
   set) { [ -e "$FAKE/ha-fail" ] || [ -e "$FAKE/ha-fail-$2" ]; } && exit 1
-       echo "$4" > "$FAKE/ha/$2" ;;
+       echo "$4" > "$FAKE/ha/$2"
+       if [[ "$4" == started && ! -e "$FAKE/no-start-$2" ]]; then echo running > "$FAKE/${2/:/\/}"; fi ;;
 esac
 """,
     "pvesh": r"""#!/usr/bin/env bash
@@ -60,6 +61,16 @@ EOF
 """,
     # ups.status as the fake upsd reports it; no file = upsd unreachable.
     "upsc": '#!/usr/bin/env bash\necho "upsc $*" >> "$FAKE/calls"\ncat "$FAKE/ups.status" 2>/dev/null || exit 1\n',
+    "guest-ready": r"""#!/usr/bin/env bash
+echo "guest-ready $*" >> "$FAKE/calls"
+case "$1" in
+  preflight) [[ ! -e "$FAKE/storage-fail-$2" ]] ;;
+  ha-state) cat "$FAKE/ha/$2" ;;
+  ready) [[ ! -e "$FAKE/health-fail-$2" ]] || exit 1
+         [[ "$(cat "$FAKE/${2/:/\/}")" == running ]] || exit 1
+         [[ "${3:-}" != --managed || "$(cat "$FAKE/ha/$2")" == started ]] ;;
+esac
+""",
     "logger": "#!/usr/bin/env bash\nexit 0\n",
     "systemctl": '#!/usr/bin/env bash\necho "systemctl $*" >> "$FAKE/calls"\n',
     "etherwake": '#!/usr/bin/env bash\necho "etherwake $*" >> "$FAKE/calls"\n',
@@ -94,6 +105,7 @@ class Fixture:
             lines += ["NAS_HOST=127.0.0.1", f'NAS_PORTS="{" ".join(str(p) for p in nas_ports)}"', f'PEER_HOSTS="{peers}"',
                       f"KILLPOWER_WAIT={wait}", "WOL_IFACE=vmbr0.2", f'WOL_TARGETS="{wol}"']
         self.conf.write_text("\n".join(lines) + "\n")
+        self.ups("OL")
 
     def env(self, **extra):
         return {
@@ -106,6 +118,8 @@ class Fixture:
             "PVE_NUT_CONF": str(self.conf),
             "PVE_NUT_NAS_POLL": "1",
             "PVE_NUT_NODE_ONLINE": str(self.bin / "node-online"),
+            "PVE_NUT_GUEST_READY": str(self.bin / "guest-ready"),
+            "PVE_NUT_STATE_WRITER": str(ROOT / "sbin/pve-nut-state.py"),
             "PVE_NUT_GATE_RETRIES": "1",
             "PVE_NUT_GATE_DELAY": "0",
             "PVE_NUT_LOCK_WAIT": "1",
@@ -215,7 +229,7 @@ class FinalWaveTest(unittest.TestCase):
         self.assertIn(f"step 4b done: NAS 127.0.0.1 closed {p1},{p2}, peers down: {PEER}", log)
         self.assertIn("all guests stopped, halting", log)
         self.assertGreaterEqual(fx.log_second("step 4b done") - fx.log_second("VM 101 stopped"), 2)
-        self.assertIn(f"script bound {30 + 30 + 90 + 20 + 45 + 180} s", log)
+        self.assertIn("script bound 552 s", log)
 
     def test_primary_halts_when_the_wait_bound_expires(self):
         sock, port = listener()
@@ -225,7 +239,7 @@ class FinalWaveTest(unittest.TestCase):
         fx.guest("vm", 201)
         fx.run(SHUTDOWN)
         self.assertTrue(fx.halted())
-        self.assertIn(f"WARN: still answering after 2 s: 127.0.0.1:{port} {PEER}; halting anyway", fx.log.read_text())
+        self.assertIn("WARN: NAS/peer readiness not confirmed within 2 s:", fx.log.read_text())
 
     def test_secondary_skips_the_wait(self):
         self.fx = fx = Fixture(role="client")
@@ -235,7 +249,7 @@ class FinalWaveTest(unittest.TestCase):
         self.assertTrue(fx.halted())
         log = fx.log.read_text()
         self.assertNotIn("step 4b", log)
-        self.assertIn(f"script bound {30 + 30 + 90 + 20 + 45} s", log)
+        self.assertIn("script bound 370 s", log)
         self.assertIn("systemctl stop pve-ha-lrm pve-ha-crm", fx.calls())
         self.assertEqual((fx.state / "parked").read_text().split(), ["ct:211"])
 
@@ -347,13 +361,13 @@ class ShedTest(unittest.TestCase):
         self.assertIn("ERROR: guest enumeration failed, nothing shed", fx.log.read_text())
         self.assertEqual(fx.run(SHUTDOWN, "--dry-run", "--shed", check=False).returncode, 1)
 
-    def test_shed_records_a_row_it_could_not_park_as_plain(self):
+    def test_shed_records_ha_intent_even_when_parking_fails(self):
         self.fx = fx = Fixture(role="client", shed="201")
         fx.guest("vm", 201, ha="started")
         (fx.fake / "ha-fail").write_text("")
         fx.run(SHUTDOWN, "--shed")
         self.assertEqual(fx.status("vm", 201), "stopped")
-        self.assertEqual((fx.state / "shed").read_text().split(), ["vm:201", "plain"])
+        self.assertEqual((fx.state / "shed").read_text().split(), ["vm:201", "ha"])
         self.assertIn("ERROR: park of vm:201 failed", fx.log.read_text())
 
 
@@ -421,7 +435,7 @@ class RestoreTest(unittest.TestCase):
         abort.write_text("")
         result = fx.run(RESTORE, check=False, PVE_NUT_ABORT_FILE=str(abort))
         self.assertEqual(result.returncode, 1)
-        self.assertIn("shed requested, restore abandoned", result.stdout)
+        self.assertIn("restore abandoned", result.stdout)
         self.assertEqual([c for c in fx.calls() if c.startswith("ha-manager")], [])
         self.assertEqual((fx.state / "parked").read_text(), "vm:213\n")
 
@@ -444,7 +458,97 @@ class RestoreTest(unittest.TestCase):
         fx.state.mkdir()
         (fx.state / "shed").write_text("")
         fx.run(RESTORE)
-        self.assertFalse((fx.state / "shed").exists())
+        self.assertTrue((fx.state / "shed").exists())
+
+    def test_accepted_start_stays_pending_until_runtime_and_application_are_healthy(self):
+        self.fx = fx = Fixture()
+        fx.state.mkdir()
+        (fx.state / "parked").write_text("vm:201\n")
+        fx.guest("vm", 201, "stopped", ha="ignored")
+        (fx.fake / "no-start-vm:201").touch()
+        self.assertEqual(fx.run(RESTORE, check=False).returncode, 1)
+        self.assertEqual(fx.ha("vm:201"), "started")
+        self.assertTrue((fx.state / "parked").exists())
+        (fx.fake / "no-start-vm:201").unlink()
+        (fx.fake / "health-fail-vm:201").touch()
+        self.assertEqual(fx.run(RESTORE, check=False).returncode, 1)
+        self.assertEqual(fx.status("vm", 201), "running")
+        self.assertTrue((fx.state / "parked").exists())
+        (fx.fake / "health-fail-vm:201").unlink()
+        fx.run(RESTORE)
+        self.assertFalse((fx.state / "parked").exists())
+
+    def test_storage_unavailable_does_not_consume_ha_start_retries(self):
+        self.fx = fx = Fixture()
+        fx.state.mkdir()
+        (fx.state / "parked").write_text("vm:201\n")
+        fx.guest("vm", 201, "stopped", ha="ignored")
+        (fx.fake / "storage-fail-vm:201").touch()
+        self.assertEqual(fx.run(RESTORE, check=False).returncode, 1)
+        self.assertEqual(fx.ha("vm:201"), "ignored")
+        self.assertFalse(any(c.startswith("ha-manager set") for c in fx.calls()))
+
+    def test_error_recovery_is_bounded_to_one_disabled_transition(self):
+        self.fx = fx = Fixture()
+        fx.state.mkdir()
+        (fx.state / "parked").write_text("vm:201\n")
+        fx.guest("vm", 201, "stopped", ha="error")
+        self.assertEqual(fx.run(RESTORE, check=False).returncode, 1)
+        self.assertEqual(fx.ha("vm:201"), "disabled")
+        fx.run(RESTORE)
+        self.assertFalse((fx.state / "parked").exists())
+        (fx.state / "parked").write_text("vm:201\n")
+        fx.guest("vm", 201, "stopped", ha="error")
+        self.assertEqual(fx.run(RESTORE, check=False).returncode, 1)
+        self.assertEqual(fx.ha("vm:201"), "error")
+        self.assertEqual(fx.calls().count("ha-manager set vm:201 --state disabled"), 1)
+
+    def test_final_wave_or_unknown_ups_blocks_direct_restore(self):
+        self.fx = fx = Fixture()
+        fx.state.mkdir()
+        (fx.state / "parked").write_text("vm:201\n")
+        fx.guest("vm", 201, "stopped", ha="ignored")
+        for status in ("", "FSD OL CHRG LB", "OB", "OL LB"):
+            with self.subTest(status=status):
+                fx.ups(status)
+                self.assertEqual(fx.run(RESTORE, check=False).returncode, 1)
+                self.assertEqual(fx.ha("vm:201"), "ignored")
+        fx.ups("OL")
+        (fx.state / "final-wave").write_text("same-boot\n")
+        self.assertEqual(fx.run(RESTORE, check=False, PVE_NUT_BOOT_ID="same-boot").returncode, 1)
+        fx.run(RESTORE, PVE_NUT_BOOT_ID="next-boot")
+        self.assertFalse((fx.state / "parked").exists())
+
+    def test_failed_error_intent_write_does_not_mutate_ha(self):
+        self.fx = fx = Fixture()
+        fx.state.mkdir()
+        (fx.state / "parked").write_text("vm:201\n")
+        fx.guest("vm", 201, "stopped", ha="error")
+        result = fx.run(RESTORE, check=False, PVE_NUT_STATE_WRITER=shutil.which("false"))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(fx.ha("vm:201"), "error")
+        self.assertFalse(any(c.startswith("ha-manager set") for c in fx.calls()))
+
+    def test_final_wave_during_readiness_preserves_old_and_new_pending_rows(self):
+        self.fx = fx = Fixture()
+        fx.state.mkdir()
+        (fx.state / "parked").write_text("vm:201\n")
+        fx.guest("vm", 201, "running", ha="started")
+        checker = fx.bin / "guest-ready"
+        checker.write_text('#!/usr/bin/env bash\nprintf "same-boot\\n" > "$PVE_NUT_STATE_DIR/final-wave"\n'
+                           'printf "vm:202\\n" >> "$PVE_NUT_STATE_DIR/parked"\nexit 0\n')
+        result = fx.run(RESTORE, check=False, PVE_NUT_BOOT_ID="same-boot")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual((fx.state / "parked").read_text(), "vm:201\nvm:202\n")
+        self.assertFalse(list(fx.state.glob("restored-*")))
+
+    def test_unknown_ha_state_never_requests_start(self):
+        self.fx = fx = Fixture()
+        fx.state.mkdir()
+        (fx.state / "parked").write_text("vm:201\n")
+        fx.guest("vm", 201, "stopped", ha="unknown")
+        self.assertEqual(fx.run(RESTORE, check=False).returncode, 1)
+        self.assertFalse(any(c.startswith("ha-manager set") for c in fx.calls()))
 
 
 WOL = "aa:bb:cc:dd:ee:01=192.0.2.13 aa:bb:cc:dd:ee:02=192.0.2.13"
@@ -458,6 +562,8 @@ def fake_restore(fx, drop=None, fail_first=False):
     body = '#!/usr/bin/env bash\necho "restore" >> "$FAKE/calls"\n'
     if drop:
         body += f': > "{fx.req / drop}"\n'
+        if drop == "shed.request":
+            body += 'echo OB > "$FAKE/ups.status"\n'
     if fail_first:
         body += '[ -e "$FAKE/restore-failed" ] || { : > "$FAKE/restore-failed"; exit 1; }\n'
     script.write_text(body)
@@ -534,6 +640,52 @@ class TierPathTest(unittest.TestCase):
         fx.run(TIER, "consume")
         self.assertEqual([c for c in fx.calls() if c.startswith("etherwake")], [])
 
+    def test_unsafe_ups_never_wakes_or_consumes_retry_budget(self):
+        self.fx = fx = Fixture(role="server", wol=WOL)
+        fx.state.mkdir()
+        (fx.state / "tier1").touch()
+        for status in ("", "FSD OL CHRG LB", "OB", "OL LB"):
+            with self.subTest(status=status):
+                fx.ups(status)
+                result = fx.run(TIER, "boot", check=False, PVE_NUT_RESTORE_CMD=fake_restore(fx))
+                self.assertEqual(result.returncode, 1)
+                self.assertFalse(any(c.startswith(("etherwake", "restore")) for c in fx.calls()))
+                self.assertFalse((fx.state / "restore-attempts").exists())
+                self.assertTrue((fx.state / "tier1").exists())
+
+    def test_failed_restore_stops_after_persisted_attempt_limit(self):
+        self.fx = fx = Fixture()
+        fx.state.mkdir()
+        (fx.state / "shed").write_text("vm:201 ha\n")
+        fx.guest("vm", 201, "stopped", ha="ignored")
+        (fx.fake / "health-fail-vm:201").touch()
+        for _ in range(3):
+            result = fx.run(TIER, "boot", check=False, PVE_NUT_RESTORE_ATTEMPTS="2")
+            self.assertEqual(result.returncode, 1)
+        self.assertIn("attempt limit 2 reached", result.stdout)
+        self.assertEqual((fx.state / "restore-attempts").read_text(), "2\n")
+        self.assertEqual(fx.calls().count("ha-manager set vm:201 --state started"), 2)
+        self.assertTrue((fx.state / "shed").exists())
+
+    def test_attempt_persistence_failure_prevents_wake_or_restore(self):
+        self.fx = fx = Fixture(role="server", wol=WOL)
+        fx.state.mkdir()
+        (fx.state / "tier1").touch()
+        result = fx.run(TIER, "boot", check=False, PVE_NUT_STATE_WRITER=shutil.which("false"))
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(any(c.startswith(("etherwake", "ha-manager set")) for c in fx.calls()))
+
+    def test_a_new_shutdown_starts_a_new_recovery_budget(self):
+        self.fx = fx = Fixture()
+        fx.state.mkdir()
+        (fx.state / "restore-attempts").write_text("10\n")
+        (fx.state / "error-reset-vm:201").touch()
+        fx.guest("vm", 201, "running", ha="started")
+        fx.run(SHUTDOWN)
+        self.assertFalse((fx.state / "restore-attempts").exists())
+        self.assertFalse((fx.state / "error-reset-vm:201").exists())
+        self.assertTrue((fx.state / "parked").exists())
+
     def test_shed_is_skipped_while_the_ups_reports_online(self):
         self.fx = fx = Fixture(role="client", shed="201")
         fx.guest("vm", 201, ha="started")
@@ -567,13 +719,15 @@ class TierPathTest(unittest.TestCase):
         fx.ups("OB")
         fx.run(UPSSCHED_CMD, "restore")
         out = fx.run(TIER, "consume").stdout
-        self.assertIn("restore requested but ups@127.0.0.1 reports 'OB', skipped", out)
+        self.assertIn("restore gate closed", out)
         self.assertEqual(fx.ha("vm:201"), "ignored")
         self.assertTrue((fx.state / "shed").exists())
 
     def test_request_arriving_during_a_restore_is_consumed_not_swept(self):
         self.fx = fx = Fixture(role="client", shed="201")
         fx.guest("vm", 201, ha="started")
+        fx.state.mkdir()
+        (fx.state / "tier1").write_text("")
         fx.run(UPSSCHED_CMD, "restore")
         out = fx.run(TIER, "consume", PVE_NUT_RESTORE_CMD=fake_restore(fx, drop="shed.request")).stdout
         self.assertNotIn("unknown request", out)
@@ -590,22 +744,24 @@ class TierPathTest(unittest.TestCase):
         fx.run(UPSSCHED_CMD, "restore")
         # Round 2 sleeps 1 s beside the restore, which drops the request at once.
         out = fx.run(TIER, "consume", PVE_NUT_RESTORE_CMD=fake_restore(fx, drop="shed.request"), PVE_NUT_WOL_DELAY="1").stdout
-        self.assertIn("shed requested, wake abandoned", out)
-        self.assertIn("shed requested during the restore, marker kept", out)
+        self.assertIn("wake abandoned", out)
+        self.assertIn("restore incomplete", out)
         self.assertEqual([c for c in fx.calls() if c.startswith("etherwake")], WAKES)
         self.assertEqual(fx.status("vm", 201), "stopped")
         self.assertTrue((fx.state / "tier1").exists())
 
-    def test_exhausted_wake_rounds_warn_and_drop_the_marker(self):
+    def test_exhausted_wake_rounds_keep_the_marker_for_retry(self):
         self.fx = fx = Fixture(role="server", wol=WOL)
         fx.state.mkdir()
         (fx.state / "tier1").write_text("")
-        out = fx.run(TIER, "restore", PVE_NUT_RESTORE_CMD=fake_restore(fx)).stdout
+        result = fx.run(TIER, "restore", check=False, PVE_NUT_RESTORE_CMD=fake_restore(fx))
+        self.assertEqual(result.returncode, 1)
+        out = result.stdout
         self.assertEqual([c for c in fx.calls() if c.startswith("etherwake")], WAKES * 3)
         calls = fx.calls()
         self.assertLess(calls.index(WAKES[0]), calls.index("restore"))
         self.assertIn("WARN: wake rounds exhausted, not seen back: " + WOL, out)
-        self.assertFalse((fx.state / "tier1").exists())
+        self.assertTrue((fx.state / "tier1").exists())
 
     def test_restore_that_gave_up_before_the_peers_answered_runs_once_more(self):
         self.fx = fx = Fixture(role="server", wol=WOL)
@@ -644,6 +800,8 @@ class TierPathTest(unittest.TestCase):
         flag.write_text("0000-00-00\n")
         upsmon_conf = fx.root / "upsmon.conf"
         upsmon_conf.write_text(f'MONITOR ups@127.0.0.1 1 u p primary\nPOWERDOWNFLAG "{flag}"\n')
+        (fx.bin / "ping").write_text(
+            '#!/usr/bin/env bash\nn=$(cat "$FAKE/pings" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE/pings"; [ "$n" -gt 2 ]\n')
         out = fx.run(TIER, "boot", PVE_NUT_RESTORE_CMD=fake_restore(fx), PVE_NUT_UPSMON_CONF=str(upsmon_conf)).stdout
         calls = fx.calls()
         restarts = [c for c in calls if "restart" in c]

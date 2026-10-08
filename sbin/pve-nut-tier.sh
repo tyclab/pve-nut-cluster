@@ -30,11 +30,15 @@ NUT_RESET="$STATE_DIR/nut-reset"
 UPSMON_CONF=${PVE_NUT_UPSMON_CONF:-/etc/nut/upsmon.conf}
 SHED_REQ="$REQ_DIR/shed.request"
 TAG=pve-nut-tier
+BOOT_ID=${PVE_NUT_BOOT_ID:-$(cat /proc/sys/kernel/random/boot_id)}
+STATE_WRITE=${PVE_NUT_STATE_WRITER:-/usr/local/sbin/pve-nut-state.py}
+RESTORE_ATTEMPTS=${PVE_NUT_RESTORE_ATTEMPTS:-10}
 
 NUT_ROLE=client
 UPS_SYS=""
 WOL_IFACE=""
 WOL_TARGETS=""
+RESTORE_METRICS_FILE=""
 if [[ -r "$CONF" ]]; then
   # shellcheck disable=SC1090
   . "$CONF"
@@ -44,8 +48,31 @@ fi
 
 log() { logger -t "$TAG" -- "$*"; echo "$*"; }
 
+publish_restore_metrics() {
+  [[ -n "$RESTORE_METRICS_FILE" ]] || return 0
+  local pending=0 attempts=0 exhausted=0 temp="$RESTORE_METRICS_FILE.$$"
+  [[ -s "$STATE_DIR/parked" || -s "$STATE_DIR/shed" || -e "$MARKER" ]] && pending=1
+  [[ -r "$STATE_DIR/restore-attempts" ]] && read -r attempts < "$STATE_DIR/restore-attempts"
+  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=$RESTORE_ATTEMPTS
+  ((pending && attempts >= RESTORE_ATTEMPTS)) && exhausted=1
+  {
+    printf 'pve_nut_restore_pending %s\n' "$pending"
+    printf 'pve_nut_restore_attempts %s\n' "$attempts"
+    printf 'pve_nut_restore_exhausted %s\n' "$exhausted"
+    printf 'pve_nut_restore_checked_timestamp_seconds %s\n' "$(date +%s)"
+  } > "$temp" && mv "$temp" "$RESTORE_METRICS_FILE"
+}
+trap publish_restore_metrics EXIT
+
 # Empty when upsd is unreachable: the timer then stands on its own.
-ups_status() { [[ -n "$UPS_SYS" ]] && upsc "$UPS_SYS" ups.status 2> /dev/null; }
+ups_status() { [[ -n "$UPS_SYS" ]] && timeout --kill-after=1 5 upsc "$UPS_SYS" ups.status 2> /dev/null; }
+restore_safe() {
+  local st
+  [[ -e "$SHED_REQ" ]] && return 1
+  [[ -r "$STATE_DIR/final-wave" && "$(cat "$STATE_DIR/final-wave")" == "$BOOT_ID" ]] && return 1
+  st=$(ups_status)
+  [[ " $st " == *" OL "* && " $st " != *" OB "* && " $st " != *" FSD "* && " $st " != *" LB "* ]]
+}
 
 do_shed() {
   local st
@@ -71,8 +98,9 @@ wake_round() { # round-number
   for t in $WOL_TARGETS; do
     peer_up "${t#*=}" && continue
     PENDING+="$t "
+    restore_safe || return 2
     mac=${t%%=*}
-    if out=$(etherwake -i "$WOL_IFACE" "$mac" 2>&1); then
+    if out=$(timeout --kill-after=1 5 etherwake -i "$WOL_IFACE" "$mac" 2>&1); then
       log "wake round $1: magic packet to $mac (${t#*=}) on $WOL_IFACE"
     else
       log "ERROR: etherwake -i $WOL_IFACE $mac: $out"
@@ -86,11 +114,11 @@ wake_peers() { # first-round; every round after round 1 waits WOL_DELAY first
   local round
   for ((round = $1; round <= WOL_ROUNDS; round++)); do
     ((round > 1)) && sleep "$WOL_DELAY"
-    if [[ -e "$SHED_REQ" ]]; then
-      log "shed requested, wake abandoned"
+    if ! restore_safe; then
+      log "shed requested or UPS/final-wave gate closed, wake abandoned"
       return 2
     fi
-    wake_round "$round"
+    wake_round "$round" || return 2
     if [[ -z "$PENDING" ]]; then
       log "wake done after $round round(s): every peer answers"
       return 0
@@ -118,7 +146,7 @@ nut_reset() {
     rm -f "$flag"
     log "WARN: $flag outlived the upsmon restart, removed"
   fi
-  rm -f "$NUT_RESET"
+  rm -f "$NUT_RESET" "$STATE_DIR/final-wave"
 }
 
 run_restore() {
@@ -127,16 +155,27 @@ run_restore() {
 }
 
 do_restore() { # timer|boot
-  local st wake=0 rc wake_pid="" wake_rc=0
+  local wake=0 rc wake_pid="" wake_rc=0 attempt=0
+  [[ -s "$STATE_DIR/parked" || -s "$STATE_DIR/shed" || -e "$MARKER" ]] || return 0
+  mkdir -p "$STATE_DIR"
+  # The request path and retry timer may fire together. Never duplicate wake/start attempts.
+  exec 8> "$STATE_DIR/.restore-lock"
+  flock -n 8 || { log "another restore is active"; return 1; }
   nut_reset
-  st=$(ups_status)
-  if [[ " $st " == *" OB "* ]]; then
-    log "restore requested but $UPS_SYS reports '$st', skipped"
-    return 0
+  if ! restore_safe; then
+    log "restore gate closed (UPS must be OL without OB/LB/FSD and no final wave); pending state kept"
+    return 1
   fi
+  [[ -r "$STATE_DIR/restore-attempts" ]] && read -r attempt < "$STATE_DIR/restore-attempts"
+  [[ "$attempt" =~ ^[0-9]+$ ]] || { log "ERROR: invalid restore-attempts; manual review required"; return 1; }
+  if ((attempt >= RESTORE_ATTEMPTS)); then
+    log "ERROR: restore attempt limit $RESTORE_ATTEMPTS reached; pending state kept for manual review"
+    return 1
+  fi
+  printf '%s\n' "$((attempt + 1))" | timeout --kill-after=1 5 "$STATE_WRITE" write "$STATE_DIR/restore-attempts" || { log "ERROR: cannot persist retry intent"; return 1; }
   [[ -e "$MARKER" ]] && can_wake && wake=1
   if ((wake)); then
-    wake_round 1
+    wake_round 1 || return 1
     if [[ -z "$PENDING" ]]; then
       log "every peer answers"
     else
@@ -149,19 +188,18 @@ do_restore() { # timer|boot
   if [[ -n "$wake_pid" ]]; then
     wait "$wake_pid"
     wake_rc=$?
-    if ((rc != 0 && wake_rc == 0)); then
+    if ((rc != 0 && wake_rc == 0)) && restore_safe; then
       log "the peers are back, restore once more"
       run_restore "$1"
       rc=$?
     fi
   fi
-  ((rc != 0)) && log "WARN: $RESTORE_CMD exited $rc; pve-nut-restore.service finishes it on the next boot"
-  [[ -e "$MARKER" ]] || return 0
-  if [[ -e "$SHED_REQ" ]]; then
-    log "shed requested during the restore, marker kept"
-    return 0
+  if ((rc != 0 || wake_rc != 0)) || ! restore_safe; then
+    log "WARN: restore incomplete (guest=$rc wake=$wake_rc); retry timer retains pending state"
+    return 1
   fi
-  rm -f "$MARKER"
+  rm -f "$MARKER" "$STATE_DIR/restore-attempts" "$STATE_DIR"/error-reset-*
+  log "restore verified; pending wake and retry state cleared"
 }
 
 consume() {

@@ -35,10 +35,26 @@ secondary, OPNsense router VMs. It has run a real mains cut end to end.
 | AC back               | BIOS "power on after AC loss" | nodes boot                                                       |
 | boot / ONLINE + 180 s | every node; WoL from primary | primary wakes halted peers; each node re-adopts its guests        |
 
-Time budget of the final wave from LB: park 30 s, HA release 30 s, graceful stop 90 s, force 20 s, edge 45 s, step
-4b 180 s. That adds up to 395 s on the primary, of the 580 s left after `FINALDELAY` and `HOSTSYNC`. The header of
-`bin/pve-nut-shutdown.sh` has the details.
+The final-wave planning budget includes lock wait, bounded API commands, both serial edge stops,
+NAS/peer probing and command kill grace:552s primary /370s secondary with two configured edges.
+Add20s NUT pre-script time,120s host teardown (a real NFS unmount consumed90s),120s UPS output
+reserve and120s margin:1032s planned on the primary. The existing600s runtime-low is432s below
+that conservative plan and is explicitly reported as insufficient. Do not raise it blindly:
+a full-charge aged battery may report only a little over1200s, leaving almost no ride time. The
+host/UPS reserves need an attended measurement after battery replacement; neither the runtime
+estimate nor a timeout guarantees survival of an ageing battery or blocked kernel I/O.
 
+Restoration requires UPS `OL` without `OB`, `LB` or `FSD`; unknown UPS status and a final-wave
+marker from this boot prevent every wake/start. A later boot may restore. Before starting a
+recorded guest, its stores and exact custom snippets must be available. Completion means actual
+VM/container runtime plus HA `started` and all configured `RESTORE_HEALTH_CHECKS` URLs returning200
+without redirects. Accepted start requests stay pending until those checks pass.
+
+The retry timer runs every60s after the last pass. At most10 safe passes attempt recovery, and
+an HA error gets at most one disabled→started recovery per outage. Failures retain their files;
+a new shutdown clears the attempt budget, while an exhausted current outage needs manual review.
+Optional `RESTORE_METRICS_FILE` exports pending/attempt/exhaustion metrics for local monitoring.
+Do not clear pending state merely because `ha-manager set` succeeded.
 LB and FSD cancel the tier-1 timer, and a shed that arrives anyway stands down. Once the final wave has started, it
 owns the guests.
 
@@ -50,6 +66,8 @@ owns the guests.
 | `bin/pve-nut-upssched-cmd.sh`    | `/usr/local/bin/`              | upssched `CMDSCRIPT` (as `nut`): drops a request file |
 | `sbin/pve-nut-tier.sh`           | `/usr/local/sbin/`             | root half: shed, restore, wake, drill NUT reset       |
 | `sbin/pve-nut-restore.sh`        | `/usr/local/sbin/`             | re-adopts parked/shed guests behind the HA gate       |
+| `sbin/pve-nut-guest-ready.py` | `/usr/local/sbin/` | read-only storage, runtime and app health gates |
+| `systemd/pve-nut-restore.timer` | `/etc/systemd/system/` | bounded retry passes for pending restoration |
 | `sbin/pve-ha-node-online.py`     | `/usr/local/sbin/`             | the gate: HA counts this node online for this boot    |
 | `systemd/pve-nut-tier.{path,service}` | `/etc/systemd/system/`    | runs `pve-nut-tier.sh consume` on a request file      |
 | `systemd/pve-nut-restore.service` | `/etc/systemd/system/`        | runs `pve-nut-tier.sh boot` when state is pending     |
@@ -66,7 +84,8 @@ make install
 systemd-tmpfiles --create /etc/tmpfiles.d/pve-nut.conf
 systemctl daemon-reload
 systemctl enable --now pve-nut-tier.path
-systemctl enable pve-nut-restore.service   # a no-op boot unit until something is parked or shed
+systemctl enable pve-nut-restore.service
+systemctl enable --now pve-nut-restore.timer # retries pending work; no guest action without recorded state
 ```
 
 Then write `/etc/nut/pve-nut.conf` from `examples/pve-nut.conf`. `NUT_ROLE=server` goes on the node with the UPS on
