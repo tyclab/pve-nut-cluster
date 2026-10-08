@@ -38,7 +38,7 @@ secondary, OPNsense router VMs. It has run a real mains cut end to end.
 The final-wave planning budget includes lock wait, bounded API commands, both serial edge stops,
 NAS/peer probing and command kill grace:552s primary /370s secondary with two configured edges.
 Add20s NUT pre-script time,120s host teardown (a real NFS unmount consumed90s),120s UPS output
-reserve and120s margin:1032s planned on the primary. The existing600s runtime-low is432s below
+reserve and120s margin:932s planned on the primary. The existing600s runtime-low is332s below
 that conservative plan and is explicitly reported as insufficient. Do not raise it blindly:
 a full-charge aged battery may report only a little over1200s, leaving almost no ride time. The
 host/UPS reserves need an attended measurement after battery replacement; neither the runtime

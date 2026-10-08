@@ -259,6 +259,8 @@ class FinalWaveTest(unittest.TestCase):
         out = fx.run(SHUTDOWN, "--dry-run").stdout
         self.assertIn("ha-manager set vm:201 --state ignored", out)
         self.assertIn("step 4b NAS shares closed and peers down (primary only, bound 180 s)", out)
+        self.assertIn("planned reserve: pre-script 20s + script 552s + host teardown 120s + UPS output 120s + margin 120s = 932s; runtime-low 600s", out)
+        self.assertIn("runtime-low is below planned reserve by 332s", out)
         self.assertFalse(fx.halted())
         self.assertEqual(fx.status("vm", 201), "running")
         self.assertFalse(fx.state.exists())

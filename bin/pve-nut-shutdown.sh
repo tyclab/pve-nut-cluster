@@ -35,7 +35,7 @@
 #   + summary10 + kill-grace allowance20 + NAS/peer182 =552s primary (370s secondary), including6s durable ownership publication.
 # Add pre-script FINALDELAY5 + primary HOSTSYNC15, HOST_TEARDOWN_RESERVE120 (includes
 # an observed96s,90s of it an NFS unmount), UPS_OUTPUT_RESERVE120 on the primary,
-# and BUDGET_MARGIN120 =>1032s primary. The default600s runtime-low is below this plan; size it to measured reserve.
+# and BUDGET_MARGIN120 =>932s primary. The default600s runtime-low is below this plan; size it to measured reserve.
 # These host/UPS values are planning reserves, not enforced hardware bounds. An
 # ageing battery can collapse before any runtime estimate; measure them under load.
 # Blocked kernel I/O cannot be made safe by a shell timeout. Do not globally use
