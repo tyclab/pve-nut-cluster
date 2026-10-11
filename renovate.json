@@ -1,7 +1,11 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:best-practices"],
-  "labels": ["dependencies"],
+  "extends": [
+    "config:best-practices"
+  ],
+  "labels": [
+    "dependencies"
+  ],
   "timezone": "Europe/Berlin",
   "minimumReleaseAge": "3 days",
   "prHourlyLimit": 2,
@@ -10,11 +14,27 @@
     {
       "customType": "regex",
       "description": "The pinned gitleaks release the CI history scan downloads",
-      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
-      "matchStrings": ["gitleaks/releases/download/v(?<currentValue>[0-9.]+)/"],
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ci\\.yml$/"
+      ],
+      "matchStrings": [
+        "gitleaks/releases/download/v(?<currentValue>[0-9.]+)/"
+      ],
       "depNameTemplate": "gitleaks/gitleaks",
       "datasourceTemplate": "github-releases",
       "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "The Renovate release the config validator in CI runs; the app runs Renovate's latest, so this follows it.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ci\\.yml$/"
+      ],
+      "matchStrings": [
+        "--package renovate@(?<currentValue>\\d+\\.\\d+\\.\\d+) "
+      ],
+      "depNameTemplate": "renovate",
+      "datasourceTemplate": "npm"
     }
   ]
 }
