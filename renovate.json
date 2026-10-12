@@ -36,5 +36,14 @@
       "depNameTemplate": "renovate",
       "datasourceTemplate": "npm"
     }
+  ],
+  "packageRules": [
+    {
+      "description": "CI tests on the python the PVE 9 hosts run (Debian 13 ships 3.13); a newer line in CI would pass what the hosts cannot run.",
+      "matchDepNames": [
+        "python"
+      ],
+      "allowedVersions": "/^3\\.13(\\.|$)/"
+    }
   ]
 }
