@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The Mend app runs Renovate's latest release, so the validator does too: a config it rejects fails here, not silently.
-      - run: npx --yes --package renovate@44.178.0 renovate-config-validator --strict
+      - run: npx --yes --package renovate@44.178.1 renovate-config-validator --strict
 
   gitleaks:
     runs-on: ubuntu-latest
