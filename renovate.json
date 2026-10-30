@@ -40,10 +40,11 @@
   ],
   "packageRules": [
     {
-      "description": "Patch and minor updates merge themselves once the branch is green and up to date with main, after the 3-day minimumReleaseAge, as in tycstation's shared preset. Majors and digest refreshes stay PRs. platformAutomerge is off: main has no branch protection, so GitHub auto-merge is unavailable and Renovate merges a green, up-to-date branch itself.",
+      "description": "Patch, minor and digest updates merge themselves once the branch is green and up to date with main, after the 3-day minimumReleaseAge, as in tycstation's shared preset. Majors stay PRs. platformAutomerge is off: main has no branch protection and the repository does not allow auto-merge, so Renovate merges a green, up-to-date branch itself.",
       "matchUpdateTypes": [
         "patch",
-        "minor"
+        "minor",
+        "digest"
       ],
       "automerge": true
     },
