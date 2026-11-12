@@ -27,7 +27,7 @@
     },
     {
       "customType": "regex",
-      "description": "The Renovate release the config validator in CI runs; the app runs Renovate's latest, so this follows it.",
+      "description": "The Renovate release the config validator in CI runs; it moves on Renovate majors only (packageRules).",
       "managerFilePatterns": [
         "/^\\.github/workflows/ci\\.yml$/"
       ],
@@ -47,6 +47,17 @@
         "digest"
       ],
       "automerge": true
+    },
+    {
+      "description": "The validator pin moves on Renovate majors only: a PR per Renovate release moved the number and never changed the validator's verdict. A renovate.json that needs a newer option bumps the pin in the same PR.",
+      "matchDepNames": [
+        "renovate"
+      ],
+      "matchUpdateTypes": [
+        "patch",
+        "minor"
+      ],
+      "enabled": false
     },
     {
       "description": "CI tests on the python the PVE 9 hosts run (Debian 13 ships 3.13); a newer line in CI would pass what the hosts cannot run.",
