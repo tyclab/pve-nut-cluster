@@ -10,7 +10,7 @@
   "minimumReleaseAge": "3 days",
   "prHourlyLimit": 2,
   "prConcurrentLimit": 3,
-  "platformAutomerge": false,
+  "platformAutomerge": true,
   "customManagers": [
     {
       "customType": "regex",
@@ -40,7 +40,7 @@
   ],
   "packageRules": [
     {
-      "description": "Patch, minor and digest updates merge themselves once the branch is green and up to date with main, after the 3-day minimumReleaseAge, as in tycstation's shared preset. Majors stay PRs. platformAutomerge is off: main has no branch protection and the repository does not allow auto-merge, so Renovate merges a green, up-to-date branch itself.",
+      "description": "Patch, minor and digest updates merge themselves once the branch is green and up to date with main, after the 3-day minimumReleaseAge, as in tycstation's shared preset. Majors stay PRs. platformAutomerge arms GitHub auto-merge, which main's ruleset holds until lint, test, renovate-config and gitleaks pass on an up-to-date branch.",
       "matchUpdateTypes": [
         "patch",
         "minor",
